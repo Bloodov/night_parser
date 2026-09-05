@@ -139,25 +139,51 @@ async def init_db():
 
         # Полнотекстовый поиск (FTS5) вместо LIKE '%...%' — быстрее и с ранжированием
         # по релевантности на больших объёмах (десятки тысяч чатов и больше).
+        # username — отдельная колонка, чтобы можно было искать публичные чаты
+        # ТОЛЬКО по title+username (без description — там часто встречаются
+        # шумовые слова вроде "админ: @contact", не относящиеся к теме чата).
         await db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS chats_fts USING fts5(
-                title, description, content='chats', content_rowid='id'
+                title, description, username, content='chats', content_rowid='id'
             )
         """)
+
+        # Миграция: у более старой версии chats_fts не было колонки username —
+        # FTS5 не поддерживает ALTER ADD COLUMN для virtual table, поэтому
+        # пересоздаём таблицу и переиндексируем всё заново (безопасно и быстро,
+        # см. 'rebuild' ниже).
+        cur = await db.execute("PRAGMA table_info(chats_fts)")
+        fts_cols = {row[1] for row in await cur.fetchall()}
+        if "username" not in fts_cols:
+            await db.executescript("""
+                DROP TRIGGER IF EXISTS chats_ai;
+                DROP TRIGGER IF EXISTS chats_ad;
+                DROP TRIGGER IF EXISTS chats_au;
+                DROP TABLE IF EXISTS chats_fts;
+            """)
+            await db.execute("""
+                CREATE VIRTUAL TABLE chats_fts USING fts5(
+                    title, description, username, content='chats', content_rowid='id'
+                )
+            """)
+            await db.execute(
+                "DELETE FROM _migrations WHERE name = 'chats_fts_rebuild'")
+            await db.commit()
+
         await db.executescript("""
             CREATE TRIGGER IF NOT EXISTS chats_ai AFTER INSERT ON chats BEGIN
-                INSERT INTO chats_fts(rowid, title, description)
-                VALUES (new.id, new.title, new.description);
+                INSERT INTO chats_fts(rowid, title, description, username)
+                VALUES (new.id, new.title, new.description, new.username);
             END;
             CREATE TRIGGER IF NOT EXISTS chats_ad AFTER DELETE ON chats BEGIN
-                INSERT INTO chats_fts(chats_fts, rowid, title, description)
-                VALUES('delete', old.id, old.title, old.description);
+                INSERT INTO chats_fts(chats_fts, rowid, title, description, username)
+                VALUES('delete', old.id, old.title, old.description, old.username);
             END;
             CREATE TRIGGER IF NOT EXISTS chats_au AFTER UPDATE ON chats BEGIN
-                INSERT INTO chats_fts(chats_fts, rowid, title, description)
-                VALUES('delete', old.id, old.title, old.description);
-                INSERT INTO chats_fts(rowid, title, description)
-                VALUES (new.id, new.title, new.description);
+                INSERT INTO chats_fts(chats_fts, rowid, title, description, username)
+                VALUES('delete', old.id, old.title, old.description, old.username);
+                INSERT INTO chats_fts(rowid, title, description, username)
+                VALUES (new.id, new.title, new.description, new.username);
             END;
             CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY);
         """)
@@ -341,14 +367,47 @@ async def search_chats(query: str, limit: int = 50):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         try:
+            # Публичные чаты — ищем по title+username, БЕЗ description: там
+            # часто встречаются шумовые слова вроде "админ: @contact",
+            # не относящиеся к теме самого чата.
             cur = await db.execute(
                 "SELECT c.username, c.title, c.member_count, c.is_private, "
                 "c.invite_link, c.language "
                 "FROM chats_fts f JOIN chats c ON c.id = f.rowid "
-                "WHERE chats_fts MATCH ? "
+                "WHERE chats_fts MATCH ? AND c.is_private = 0 "
                 "ORDER BY bm25(chats_fts), c.member_count DESC LIMIT ?",
-                (fts_query, limit))
-            rows = await cur.fetchall()
+                (f"{{title username}}: {fts_query}", limit))
+            public_rows = await cur.fetchall()
+
+            # FTS5 матчит ПРЕФИКСЫ ТОКЕНОВ: username вроде "secretcryptoclub" —
+            # это один токен без разделителей, и "crypto"* не найдёт совпадение
+            # ПОСЕРЕДИНЕ слова (только "начинается с"). Юзернеймы часто клеят
+            # слова слитно, поэтому дополнительно ищем подстроку через LIKE —
+            # она не зависит от токенизации и найдёт "crypto" где угодно внутри.
+            like = f"%{query.strip()}%"
+            cur = await db.execute(
+                "SELECT username, title, member_count, is_private, invite_link, language "
+                "FROM chats WHERE is_private = 0 AND username LIKE ? "
+                "ORDER BY member_count DESC LIMIT ?", (like, limit))
+            like_rows = await cur.fetchall()
+            seen_usernames = {r["username"] for r in public_rows}
+            for r in like_rows:
+                if r["username"] not in seen_usernames:
+                    public_rows.append(r)
+                    seen_usernames.add(r["username"])
+
+            # Приватные чаты (мы не можем проверить их username/участников) —
+            # ищем по title+description, как раньше.
+            cur = await db.execute(
+                "SELECT c.username, c.title, c.member_count, c.is_private, "
+                "c.invite_link, c.language "
+                "FROM chats_fts f JOIN chats c ON c.id = f.rowid "
+                "WHERE chats_fts MATCH ? AND c.is_private = 1 "
+                "ORDER BY bm25(chats_fts), c.member_count DESC LIMIT ?",
+                (f"{{title description}}: {fts_query}", limit))
+            private_rows = await cur.fetchall()
+
+            rows = (public_rows + private_rows)[:limit]
         except aiosqlite.OperationalError:
             # Подстраховка на случай нестандартной сборки SQLite без FTS5 —
             # возвращаемся к прежнему поиску через LIKE (без транслитерации:
@@ -356,8 +415,8 @@ async def search_chats(query: str, limit: int = 50):
             like = f"%{query}%"
             cur = await db.execute(
                 "SELECT username, title, member_count, is_private, invite_link, language "
-                "FROM chats WHERE title LIKE ? OR description LIKE ? "
-                "ORDER BY member_count DESC LIMIT ?", (like, like, limit))
+                "FROM chats WHERE title LIKE ? OR description LIKE ? OR username LIKE ? "
+                "ORDER BY member_count DESC LIMIT ?", (like, like, like, limit))
             rows = await cur.fetchall()
 
     # Сортировка результатов — устойчивая (relevance-порядок внутри каждой
